@@ -153,7 +153,7 @@ sub start_server {
     # setup signal handlers
     $SIG{$_} = sub {
         push @signals_received, $_[0];
-    } for (qw/INT TERM HUP/);
+    } for (qw/INT TERM HUP QUIT/);
     $SIG{PIPE} = 'IGNORE';
     
     # setup status monitor
@@ -163,12 +163,9 @@ sub start_server {
             my $tmpfn = "$opts->{status_file}.$$";
             open my $tmpfh, '>', $tmpfn
                 or die "failed to create temporary file:$tmpfn:$!";
-            my %gen_pid = (
-                ($current_worker
-                 ? ($ENV{SERVER_STARTER_GENERATION} => $current_worker)
-                 : ()),
-                map { $old_workers{$_} => $_ } keys %old_workers,
-            );
+            my %gen_pid;
+            $gen_pid{$ENV{SERVER_STARTER_GENERATION}} = $current_worker if $current_worker;
+            @gen_pid{values %old_workers} = keys %old_workers; # pid => #  to  # => pid
             print $tmpfh "$_:$gen_pid{$_}\n"
                 for sort keys %gen_pid;
             close $tmpfh;
@@ -178,100 +175,116 @@ sub start_server {
         };
     
     # the main loop
-    my $term_signal = 0;
-    $current_worker = _start_worker($opts);
-    $update_status->();
     my $auto_restart_interval = 0;
-    my $last_restart_time = time();
-    my $restart_flag = 0;
+    my $last_restart_time = 0;
+    my $last_reload_env_time = 0;
+    my $upon_settling;
+  MAINLOOP:
     while (1) {
-        my %loaded_env = _reload_env();
-        my @loaded_env_keys = keys %loaded_env;
-        local @ENV{@loaded_env_keys} = map { $loaded_env{$_} } (@loaded_env_keys);
-        if ($ENV{ENABLE_AUTO_RESTART}) {
-            # restart workers periodically
-            $auto_restart_interval = $ENV{AUTO_RESTART_INTERVAL} ||= 360;
-        }
-        sleep(1);
-        my $died_worker = -1;
-        my $status = -1;
-        while (1) {
-            $died_worker = waitpid(-1, WNOHANG);
-            $status = $?;
-            last if ($died_worker <= 0);
-            if ($died_worker == $current_worker) {
-                print STDERR "worker $died_worker died unexpectedly with status:$status, restarting\n";
-                $current_worker = _start_worker($opts);
-                $last_restart_time = time();
-            } else {
-                print STDERR "old worker $died_worker died, status:$status\n";
-                delete $old_workers{$died_worker};
-                # don't update the status file if restart is scheduled and died_worker is the last one
-                if ($restart_flag == 0 || scalar(keys %old_workers) != 0) {
+        for (@signals_received) {
+            if ($_ eq 'INT' || $_ eq 'TERM' || $_ eq 'QUIT') {
+                my $term_signal = $_ eq 'TERM' ? $opts->{signal_on_term} : 'TERM';
+                if ($current_worker) {
+                    $old_workers{$current_worker} = $ENV{SERVER_STARTER_GENERATION};
+                    undef $current_worker;
+                }
+                print STDERR "received $_, sending $term_signal to all workers:",
+                    join(',', sort keys %old_workers), "\n";
+                kill $term_signal, $_ for sort keys %old_workers;
+                if ($_ eq 'QUIT') {
+                    # graceful termination of start_server
+                    while (%old_workers) {
+                        if (my @r = wait3(1)) {
+                            my ($pid, $status) = @r;
+                            print STDERR "worker $pid died, status:$status\n";
+                            delete $old_workers{$pid};
+                            $update_status->();
+                        }
+                    }
+                } else {
+                    # immediate termination of start_server
+                    while (%old_workers) {
+                        delete $old_workers{(keys %old_workers)[0]};
+                    }
                     $update_status->();
+                }
+                last MAINLOOP;
+            } elsif ($_ eq 'HUP') {
+                if (%old_workers) {
+                    print STDERR "received $_, won't restart, old workers still running\n";
+                } else {
+                    if ($current_worker) {
+                        if ($upon_settling) {
+                            print STDERR "received $_, won't restart, still starting\n";
+                        } else {
+                            print STDERR "received $_ and scheduled server program restart\n";
+                            $old_workers{$current_worker} = $ENV{SERVER_STARTER_GENERATION};
+                            undef $current_worker;
+                        }
+                    } else {
+                        print STDERR "received $_, server program restart already scheduled\n";
+                    }
                 }
             }
         }
-        if ($auto_restart_interval > 0 && scalar(@signals_received) == 0 &&
-            time() > $last_restart_time + $auto_restart_interval) {
-            print STDERR "autorestart triggered (interval=$auto_restart_interval)\n";
-            $restart_flag = 1;
-            if (time() > $last_restart_time + $auto_restart_interval * 2) {
-                print STDERR "force autorestart triggered\n";
-                $restart_flag = 2;
+        @signals_received = ();
+
+        if (time() - $last_reload_env_time > 30) {
+            my %loaded_env = _reload_env();
+            $last_reload_env_time = time();
+            local @ENV{keys %loaded_env} = values %loaded_env;
+            if ($ENV{ENABLE_AUTO_RESTART}) {
+                # restart workers periodically
+                $auto_restart_interval = $ENV{AUTO_RESTART_INTERVAL} ||= 360;
             }
         }
-        my $num_old_workers = scalar(keys %old_workers);
-        for (; @signals_received; shift @signals_received) {
-            if ($signals_received[0] eq 'HUP') {
-                print STDERR "received HUP (num_old_workers=$num_old_workers)\n";
-                $restart_flag = 1;
-            } else {
-                $term_signal = $signals_received[0] eq 'TERM' ? $opts->{signal_on_term} : 'TERM';
-                goto CLEANUP;
-            }
-        }
-        if ($restart_flag > 1 || ($restart_flag > 0 && $num_old_workers == 0)) {
-            print STDERR "spawning a new worker (num_old_workers=$num_old_workers)\n";
-            $old_workers{$current_worker} = $ENV{SERVER_STARTER_GENERATION};
+
+        if (!$current_worker) {
             $current_worker = _start_worker($opts);
             $last_restart_time = time();
-            $restart_flag = 0;
-            $update_status->();
-            print STDERR "new worker is now running, sending $opts->{signal_on_hup} to old workers:";
-            if (%old_workers) {
-                print STDERR join(',', sort keys %old_workers), "\n";
-            } else {
-                print STDERR "none\n";
-            }
-            my $kill_old_delay = $ENV{KILL_OLD_DELAY} || 0;
-            $kill_old_delay ||= 5 if $ENV{ENABLE_AUTO_RESTART};
-            print STDERR "sleep $kill_old_delay secs\n";
-            sleep($kill_old_delay) if $kill_old_delay > 0;
-            print STDERR "killing old workers\n";
-            kill $opts->{signal_on_hup}, $_
-                for sort keys %old_workers;
+            $upon_settling = sub { $update_status->() };
         }
-    }
-    
- CLEANUP:
-    # cleanup
-    $old_workers{$current_worker} = $ENV{SERVER_STARTER_GENERATION};
-    undef $current_worker;
 
-    print STDERR "received $signals_received[0], sending $term_signal to all workers:",
-        join(',', sort keys %old_workers), "\n";
-    kill $term_signal, $_
-        for sort keys %old_workers;
-    while (%old_workers) {
-        if (my @r = wait3(1)) {
-            my ($died_worker, $status) = @r;
-            print STDERR "worker $died_worker died, status:$status\n";
-            delete $old_workers{$died_worker};
+        while (1) {
+            my $died_worker = waitpid(-1, WNOHANG);
+            last if ($died_worker <= 0);
+            my $status = $?;
+            if ($died_worker == $current_worker) {
+                print STDERR "worker $died_worker died unexpectedly with status:$status\n";
+                undef $current_worker;
+            } else {
+                print STDERR "old worker $died_worker died, status:$status\n";
+                delete $old_workers{$died_worker};
+            }
             $update_status->();
         }
+
+        my $uptime = time() - $last_restart_time;
+        if ($uptime >= $opts->{interval}) {
+            if ($upon_settling) {
+                print STDERR "worker $current_worker settled after $uptime seconds\n";
+                $upon_settling->();
+                undef $upon_settling;
+            }
+            if (%old_workers) {
+                my $kill_old_delay = $ENV{KILL_OLD_DELAY} || ($ENV{ENABLE_AUTO_RESTART} ? 5 : 0);
+                if ($uptime >= $kill_old_delay) {
+                    print STDERR "sending $opts->{signal_on_hup} to old workers:"
+                        , join(',', sort keys %old_workers), "\n";
+                    kill $opts->{signal_on_hup}, $_ for sort keys %old_workers;
+                }
+            }
+        }
+
+        if ($uptime > $auto_restart_interval) {
+            print STDERR "auto restarting after $uptime seconds\n";
+            push @signals_received, 'HUP';
+            next;
+        }
+
+        sleep(1);
     }
-    
+
     print STDERR "exiting\n";
 }
 
@@ -343,31 +356,22 @@ sub _reload_env {
 
 sub _start_worker {
     my $opts = shift;
-    my $pid;
-    while (1) {
-        $ENV{SERVER_STARTER_GENERATION}++;
-        $pid = fork;
-        die "fork(2) failed:$!"
-            unless defined $pid;
-        if ($pid == 0) {
-            my @args = @{$opts->{exec}};
-            # child process
-            if (defined $opts->{dir}) {
-                chdir $opts->{dir} or die "failed to chdir:$!";
-            }
-            { exec { $args[0] } @args };
-            print STDERR "failed to exec $args[0]$!";
-            exit(255);
+    $ENV{SERVER_STARTER_GENERATION}++;
+    my $pid = fork;
+    die "fork(2) failed:$!"
+        unless defined $pid;
+    if ($pid == 0) {
+        my @args = @{$opts->{exec}};
+        # child process
+        if (defined $opts->{dir}) {
+            chdir $opts->{dir} or die "failed to chdir:$!";
         }
-        print STDERR "starting new worker $pid\n";
-        sleep $opts->{interval};
-        if ((grep { $_ ne 'HUP' } @signals_received)
-                || waitpid($pid, WNOHANG) <= 0) {
-            last;
-        }
-        print STDERR "new worker $pid seems to have failed to start, exit status:$?\n";
+        { exec { $args[0] } @args };
+        print STDERR "[Server::Starter] failed to exec $args[0]$!";
+        exit(255);
     }
-    $pid;
+    print STDERR "[Server::Starter] starting new worker $pid\n";
+    return $pid;
 }
 
 1;

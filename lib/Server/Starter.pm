@@ -276,7 +276,7 @@ sub start_server {
             }
         }
 
-        if ($uptime > $auto_restart_interval) {
+        if ($ENV{ENABLE_AUTO_RESTART} && $uptime > $auto_restart_interval) {
             print STDERR "auto restarting after $uptime seconds\n";
             push @signals_received, 'HUP';
             next;
@@ -367,10 +367,10 @@ sub _start_worker {
             chdir $opts->{dir} or die "failed to chdir:$!";
         }
         { exec { $args[0] } @args };
-        print STDERR "[Server::Starter] failed to exec $args[0]$!";
+        print STDERR "failed to exec $args[0]$!";
         exit(255);
     }
-    print STDERR "[Server::Starter] starting new worker $pid\n";
+    print STDERR "starting new worker $pid\n";
     return $pid;
 }
 
